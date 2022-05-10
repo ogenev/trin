@@ -51,10 +51,9 @@ pub struct UtpAccept {
     pub message: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-// This is not in a spec, this is just for internally tracking for what portal message
-// negotiated the uTP stream
-#[derive(Debug, Clone)]
-pub enum UtpMessageId {
+/// Used to track which stream to which overlay request correspond
+#[derive(Debug, Clone, PartialEq)]
+pub enum UtpStreamId {
     FindContentStream,
     FindContentData(Content),
     OfferStream,

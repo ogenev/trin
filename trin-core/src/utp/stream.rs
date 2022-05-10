@@ -25,7 +25,7 @@ use crate::{
     utp::{
         packets::{ExtensionType, Packet, PacketType, HEADER_SIZE},
         time::{now_microseconds, Delay, Timestamp},
-        trin_helpers::{UtpMessage, UtpMessageId},
+        trin_helpers::{UtpMessage, UtpStreamId},
         util::{abs_diff, ewma, generate_sequential_identifiers},
     },
 };
@@ -61,6 +61,9 @@ const DISCV5_SOCKET_TIMEOUT: u64 = 25;
 
 /// uTP connection id
 type ConnId = u16;
+
+/// uTP payload data
+pub type UtpPayload = Vec<u8>;
 
 pub fn rand() -> u16 {
     rand::thread_rng().gen()
@@ -111,6 +114,8 @@ pub enum UtpListenerRequest {
     FindContentData(ConnId, ByteList),
     /// Request to listen for FindContent stream
     FindContentStream(ConnId),
+    /// Process all streams where uTP socket state is "Closed"
+    ProcessClosedStreams(oneshot::Sender<Vec<(UtpPayload, UtpStreamId)>>),
     /// Request to listen for Offer stream
     OfferStream(ConnId),
 }
@@ -122,7 +127,7 @@ pub struct UtpListener {
     /// Store all active connections
     utp_connections: HashMap<ConnectionKey, UtpSocket>,
     /// uTP connection ids to listen for
-    listening: HashMap<ConnId, UtpMessageId>,
+    listening: HashMap<ConnId, UtpStreamId>,
     /// Receiver for uTP events sent from the main portal event handler
     utp_event_rx: UnboundedReceiver<TalkRequest>,
     /// Receiver for uTP requests sent from the overlay layer
@@ -221,9 +226,9 @@ impl UtpListener {
                             // TODO: Probably there is a better way with lifetimes to pass the HashMap value to a
                             // different thread without removing the key and re-adding it.
                             self.listening
-                                .insert(conn.sender_connection_id, UtpMessageId::FindContentStream);
+                                .insert(conn.sender_connection_id, UtpStreamId::FindContentStream);
 
-                            if let Some(UtpMessageId::FindContentData(Content(content_data))) =
+                            if let Some(UtpStreamId::FindContentData(Content(content_data))) =
                                 utp_message_id
                             {
                                 // We want to send uTP data only if the content is Content(ByteList)
@@ -264,12 +269,17 @@ impl UtpListener {
                                 return;
                             }
 
+                            let mut result = Vec::new();
+
                             let mut buf = [0; BUF_SIZE];
-                            if let Err(msg) = conn.recv(&mut buf).await {
-                                error!("Unable to receive uTP DATA packet: {msg}")
-                            } else {
-                                conn.recv_data_stream
-                                    .append(&mut Vec::from(packet.payload()));
+                            match conn.recv(&mut buf).await {
+                                Ok(bytes_read) => {
+                                    if let Some(bytes) = bytes_read {
+                                        result.extend_from_slice(&buf[..bytes]);
+                                        conn.recv_data_stream.append(&mut result);
+                                    }
+                                }
+                                Err(err) => error!("Unable to receive uTP DATA packet: {err}"),
                             }
                         }
                     }
@@ -314,24 +324,29 @@ impl UtpListener {
         match request {
             UtpListenerRequest::FindContentStream(conn_id) => {
                 self.listening
-                    .insert(conn_id, UtpMessageId::FindContentStream);
+                    .insert(conn_id, UtpStreamId::FindContentStream);
             }
             UtpListenerRequest::Connect(conn_id, node_id, tx) => {
                 let conn = self.connect(conn_id, node_id).await;
                 if tx.send(conn).is_err() {
-                    warn!("Unable to send uTP socket to requester")
+                    error!("Unable to send uTP socket to requester")
                 };
             }
             UtpListenerRequest::OfferStream(conn_id) => {
-                self.listening.insert(conn_id, UtpMessageId::OfferStream);
+                self.listening.insert(conn_id, UtpStreamId::OfferStream);
             }
             UtpListenerRequest::FindContentData(conn_id, content) => {
                 self.listening
-                    .insert(conn_id, UtpMessageId::FindContentData(Content(content)));
+                    .insert(conn_id, UtpStreamId::FindContentData(Content(content)));
             }
             UtpListenerRequest::AcceptStream(conn_id, accepted_keys) => {
                 self.listening
-                    .insert(conn_id, UtpMessageId::AcceptStream(accepted_keys));
+                    .insert(conn_id, UtpStreamId::AcceptStream(accepted_keys));
+            }
+            UtpListenerRequest::ProcessClosedStreams(tx) => {
+                if tx.send(self.process_closed_streams()).is_err() {
+                    error!("Unable to send closed uTP streams to requester")
+                };
             }
         }
     }
@@ -355,28 +370,32 @@ impl UtpListener {
         }
     }
 
-    // https://github.com/ethereum/portal-network-specs/pull/98\
-    // Currently the way to handle data over uTP isn't finalized yet, so we are going to use the
-    // handle data on connection closed method, as that seems to be the accepted method for now.
-    pub async fn process_utp_byte_stream(&mut self) {
-        let mut utp_connections = self.utp_connections.clone();
-        for (conn_key, conn) in self.utp_connections.iter_mut() {
-            if conn.state == SocketState::Closed {
-                let received_stream = conn.recv_data_stream.clone();
-                debug!("Received data: with len: {}", received_stream.len());
+    /// Return and cleanup all active uTP streams where socket state is "Closed"
+    pub fn process_closed_streams(&mut self) -> Vec<(UtpPayload, UtpStreamId)> {
+        // This seems to be a hot loop, we may need to optimise it and find a better way to filter by closed
+        // connections without cloning all records. One reasonable way is to use some data-oriented
+        // design principles like Struct of Arrays vs. Array of Structs.
+        self.utp_connections
+            .clone()
+            .iter()
+            .filter(|conn| conn.1.state == SocketState::Closed)
+            .map(|conn| {
+                // Remove the closed connections from active connections
+                let receiver_stream_id = self
+                    .listening
+                    .remove(&conn.1.receiver_connection_id)
+                    .expect("Receiver connection id should match active listening connections.");
+                self.listening
+                    .remove(&conn.1.sender_connection_id)
+                    .expect("Sender connection id should match active listening connections.");
+                let utp_socket = self
+                    .utp_connections
+                    .remove(conn.0)
+                    .expect("uTP socket should match asctive utp connections.");
 
-                match self.listening.get(&conn.receiver_connection_id) {
-                    Some(message_type) => {
-                        if let UtpMessageId::AcceptStream(content_keys) = message_type {
-                            // TODO: Implement this with overlay store and decode receiver stream if multiple content values are send
-                            debug!("Store {content_keys:?}, {received_stream:?}");
-                        }
-                    }
-                    _ => warn!("uTP listening HashMap doesn't have uTP stream message type"),
-                }
-                utp_connections.remove(conn_key);
-            }
-        }
+                (utp_socket.recv_data_stream, receiver_stream_id)
+            })
+            .collect()
     }
 }
 

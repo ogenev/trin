@@ -19,6 +19,7 @@ use crate::{
     utp::stream::UtpListenerRequest,
 };
 
+use crate::utp::{stream::UtpPayload, trin_helpers::UtpStreamId};
 use delay_map::HashSetDelay;
 use discv5::{
     enr::NodeId,
@@ -45,6 +46,10 @@ pub const FIND_CONTENT_MAX_NODES: usize = 32;
 /// With even distribution assumptions, 2**17 is enough to put each node (estimating 100k nodes,
 /// which is more than 10x the ethereum mainnet node count) into a unique bucket by the 17th bucket index.
 const EXPECTED_NON_EMPTY_BUCKETS: usize = 17;
+/// Bucket refresh lookup interval in seconds
+const BUCKET_REFRESH_INTERVAL: u64 = 60;
+/// Process uTP streams interval in milliseconds
+const PROCESS_UTP_STREAMS_INTERVAL: u64 = 20;
 
 /// An overlay request error.
 #[derive(Clone, Error, Debug)]
@@ -377,7 +382,10 @@ impl<TContentKey: OverlayContentKey + Send, TMetric: Metric + Send>
     /// Bucket maintenance: Maintain the routing table (more info documented above function).
     async fn start(&mut self) {
         // Construct bucket refresh interval
-        let mut bucket_refresh_interval = tokio::time::interval(Duration::from_secs(60));
+        let mut bucket_refresh_interval =
+            tokio::time::interval(Duration::from_secs(BUCKET_REFRESH_INTERVAL));
+        let mut process_utp_streams_interval =
+            tokio::time::interval(Duration::from_millis(PROCESS_UTP_STREAMS_INTERVAL));
 
         loop {
             tokio::select! {
@@ -406,6 +414,22 @@ impl<TContentKey: OverlayContentKey + Send, TMetric: Metric + Send>
                     if let kbucket::Entry::Present(ref mut entry, _) = self.kbuckets.write().entry(&key) {
                         self.ping_node(&entry.value().enr());
                         self.peers_to_ping.insert(node_id);
+                    }
+                }
+                _ = process_utp_streams_interval.tick() => {
+                    let (tx, rx) = tokio::sync::oneshot::channel::<Vec<(UtpPayload, UtpStreamId)>>();
+
+                    // Send request to uTP listener to process all closed uTP streams and wait for response
+                    if let Err(err) = self.utp_listener_tx.send(UtpListenerRequest::ProcessClosedStreams(tx)) {
+                        error!("Unable to send ProcessClosedStreams request to uTP listener: {err}");
+                        continue
+                    }
+
+                    match rx.await {
+                        Ok(streams) => {
+                            self.handle_utp_payload(streams);
+                        }
+                        Err(err) => error!("Unable to receive ProcessClosedStreams response from uTP listener: {err}")
                     }
                 }
                 _ = OverlayService::<TContentKey, TMetric>::bucket_maintenance_poll(self.protocol.clone(), &self.kbuckets) => {}
@@ -707,6 +731,19 @@ impl<TContentKey: OverlayContentKey + Send, TMetric: Metric + Send>
         Ok(accept)
     }
 
+    /// Handle all closed uTP streams, currently we process only AcceptStream here.
+    /// FindContent payload is processed explicitly when we send FindContent request.
+    fn handle_utp_payload(&self, streams: Vec<(UtpPayload, UtpStreamId)>) {
+        for stream in streams {
+            match stream {
+                (payload, UtpStreamId::AcceptStream(content_keys)) => {
+                    self.process_accept_utp_payload(content_keys, payload);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Sends a TALK request via Discovery v5 to some destination node.
     fn send_talk_req(&self, request: Request, request_id: OverlayRequestId, destination: Enr) {
         let discovery = Arc::clone(&self.discovery);
@@ -736,6 +773,12 @@ impl<TContentKey: OverlayContentKey + Send, TMetric: Metric + Send>
                 response,
             });
         });
+    }
+
+    /// Process accepted uTP payload of the OFFER?ACCEPT stream
+    fn process_accept_utp_payload(&self, content_keys: Vec<Vec<u8>>, payload: UtpPayload) {
+        // TODO: Verify the payload, store the content and propagate gossip.
+        debug!("DEBUG: Processing content keys: {content_keys:?}, with payload: {payload:?}");
     }
 
     /// Processes an incoming request from some source node.
