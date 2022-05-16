@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 // These are just some Trin helper functions
 
-use crate::portalnet::types::messages::Content;
+use crate::portalnet::types::{content_key::RawContentKey, messages::Content};
 use ssz_derive::{Decode, Encode};
 
 // These Utp impl are related to sending messages over uTP not the implementation itself or stream
@@ -57,7 +57,7 @@ pub enum UtpStreamId {
     FindContentStream,
     FindContentData(Content),
     OfferStream,
-    AcceptStream(Vec<Vec<u8>>),
+    AcceptStream(Vec<RawContentKey>),
 }
 
 #[cfg(test)]

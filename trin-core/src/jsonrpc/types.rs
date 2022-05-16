@@ -10,7 +10,7 @@ use validator::{Validate, ValidationError};
 use crate::{
     jsonrpc::endpoints::{HistoryEndpoint, StateEndpoint, TrinEndpoint},
     portalnet::types::{
-        content_key::OverlayContentKey,
+        content_key::{OverlayContentKey, RawContentKey},
         messages::{ByteList, CustomPayload, SszEnr},
     },
 };
@@ -274,7 +274,7 @@ impl TryFrom<[&Value; 2]> for OfferParams {
                     .collect();
 
                 if let Ok(content_keys) = content_keys {
-                    let content_keys: Result<Vec<Vec<u8>>, _> =
+                    let content_keys: Result<Vec<RawContentKey>, _> =
                         content_keys.iter().map(hex::decode).collect();
 
                     if let Ok(content_keys) = content_keys {

@@ -19,7 +19,10 @@ use crate::{
     utp::stream::UtpListenerRequest,
 };
 
-use crate::utp::{stream::UtpPayload, trin_helpers::UtpStreamId};
+use crate::{
+    portalnet::types::content_key::RawContentKey,
+    utp::{stream::UtpPayload, trin_helpers::UtpStreamId},
+};
 use delay_map::HashSetDelay;
 use discv5::{
     enr::NodeId,
@@ -776,7 +779,7 @@ impl<TContentKey: OverlayContentKey + Send, TMetric: Metric + Send>
     }
 
     /// Process accepted uTP payload of the OFFER?ACCEPT stream
-    fn process_accept_utp_payload(&self, content_keys: Vec<Vec<u8>>, payload: UtpPayload) {
+    fn process_accept_utp_payload(&self, content_keys: Vec<RawContentKey>, payload: UtpPayload) {
         // TODO: Verify the payload, store the content and propagate gossip.
         debug!("DEBUG: Processing content keys: {content_keys:?}, with payload: {payload:?}");
     }

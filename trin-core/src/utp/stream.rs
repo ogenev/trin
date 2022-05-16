@@ -21,7 +21,10 @@ use tokio::{
 
 use crate::{
     locks::RwLoggingExt,
-    portalnet::types::messages::{ByteList, Content::Content, ProtocolId},
+    portalnet::types::{
+        content_key::RawContentKey,
+        messages::{ByteList, Content::Content, ProtocolId},
+    },
     utp::{
         packets::{ExtensionType, Packet, PacketType, HEADER_SIZE},
         time::{now_microseconds, Delay, Timestamp},
@@ -107,7 +110,7 @@ struct DelayDifferenceSample {
 /// and uTP listener
 pub enum UtpListenerRequest {
     /// Request to listen for Accept stream
-    AcceptStream(ConnId, Vec<Vec<u8>>),
+    AcceptStream(ConnId, Vec<RawContentKey>),
     /// Request to initialize uTP streram with remote node
     Connect(ConnId, NodeId, oneshot::Sender<anyhow::Result<UtpSocket>>),
     /// Request to listen for FindCOntent stream and send content data
