@@ -18,7 +18,7 @@ use crate::portalnet::{
 use crate::{
     portalnet::types::content_key::RawContentKey,
     utp::{
-        stream::{UtpListenerRequest, UtpSocket, BUF_SIZE},
+        stream::{UtpListenerEvent, UtpListenerRequest, UtpSocket, BUF_SIZE},
         trin_helpers::{UtpAccept, UtpMessage},
     },
 };
@@ -32,7 +32,10 @@ use futures::channel::oneshot;
 use parking_lot::RwLock;
 use ssz::Encode;
 use ssz_types::VariableList;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{
+    mpsc::{UnboundedReceiver, UnboundedSender},
+    RwLock as TRwLock,
+};
 use tracing::{debug, warn};
 
 pub use super::overlay_service::{OverlayRequestError, RequestDirection};
@@ -98,6 +101,7 @@ impl<TContentKey: OverlayContentKey + Send, TMetric: Metric + Send>
         config: OverlayConfig,
         discovery: Arc<Discovery>,
         utp_listener_tx: UnboundedSender<UtpListenerRequest>,
+        utp_listener_rx: Arc<TRwLock<UnboundedReceiver<UtpListenerEvent>>>,
         storage: Arc<RwLock<PortalStorage>>,
         data_radius: U256,
         protocol: ProtocolId,
@@ -120,6 +124,7 @@ impl<TContentKey: OverlayContentKey + Send, TMetric: Metric + Send>
             Arc::clone(&data_radius),
             protocol.clone(),
             utp_listener_tx.clone(),
+            utp_listener_rx,
             config.enable_metrics,
         )
         .await

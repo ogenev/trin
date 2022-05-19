@@ -61,12 +61,17 @@ const BASE_HISTORY: usize = 10; // base delays history size
 const MAX_BASE_DELAY_AGE: Delay = Delay(60_000_000);
 // Discv5 socket timeout in milliseconds
 const DISCV5_SOCKET_TIMEOUT: u64 = 25;
+/// Process uTP streams interval in milliseconds
+const PROCESS_UTP_STREAMS_INTERVAL: u64 = 20;
 
 /// uTP connection id
 type ConnId = u16;
 
 /// uTP payload data
 pub type UtpPayload = Vec<u8>;
+
+/// UtpListener unbounded receiver for emitted events
+pub type UtpListenerUnboundedReceiver = Arc<RwLock<UnboundedReceiver<UtpListenerEvent>>>;
 
 pub fn rand() -> u16 {
     rand::thread_rng().gen()
@@ -117,13 +122,19 @@ pub enum UtpListenerRequest {
     FindContentData(ConnId, ByteList),
     /// Request to listen for FindContent stream
     FindContentStream(ConnId),
-    /// Process all streams where uTP socket state is "Closed"
-    ProcessClosedStreams(oneshot::Sender<Vec<(UtpPayload, UtpStreamId)>>),
     /// Request to listen for Offer stream
     OfferStream(ConnId),
 }
 
-// Basically the same idea as in the official Bit Torrent library we will store all of the active connections data here
+/// Result from processing all closed uTP streams. Includes a tuple with the payload and the stream id.
+type ProcessedClosedStreams = Vec<(UtpPayload, UtpStreamId)>;
+
+/// Emitted event with all processed uTP streams. Used to handle the uTP payload in overlay service
+pub enum UtpListenerEvent {
+    ProcessedClosedStreams(ProcessedClosedStreams),
+}
+
+/// Main uTP service used to listen and handle all uTP connections and streams
 pub struct UtpListener {
     /// Base discv5 layer
     discovery: Arc<Discovery>,
@@ -133,6 +144,8 @@ pub struct UtpListener {
     listening: HashMap<ConnId, UtpStreamId>,
     /// Receiver for uTP events sent from the main portal event handler
     utp_event_rx: UnboundedReceiver<TalkRequest>,
+    /// Sender to overlay layer with processed uTP stream
+    overlay_tx: UnboundedSender<UtpListenerEvent>,
     /// Receiver for uTP requests sent from the overlay layer
     overlay_rx: UnboundedReceiver<UtpListenerRequest>,
 }
@@ -143,21 +156,26 @@ impl UtpListener {
     ) -> (
         UnboundedSender<TalkRequest>,
         UnboundedSender<UtpListenerRequest>,
+        UtpListenerUnboundedReceiver,
         Self,
     ) {
         // Channel to process uTP TalkReq packets from main portal event handler
         let (utp_event_tx, utp_event_rx) = unbounded_channel::<TalkRequest>();
         // Channel to process portal overlay requests
         let (utp_listener_tx, utp_listener_rx) = unbounded_channel::<UtpListenerRequest>();
+        // Channel to emit processed uTP payload to overlay service
+        let (overlay_tx, overlay_rx) = unbounded_channel::<UtpListenerEvent>();
 
         (
             utp_event_tx,
             utp_listener_tx,
+            Arc::new(RwLock::new(overlay_rx)),
             UtpListener {
                 discovery,
                 utp_connections: HashMap::new(),
                 listening: HashMap::new(),
                 utp_event_rx,
+                overlay_tx,
                 overlay_rx: utp_listener_rx,
             },
         )
@@ -165,13 +183,23 @@ impl UtpListener {
 
     /// The main execution loop of the UtpListener service.
     pub async fn start(&mut self) {
+        let mut process_utp_streams_interval =
+            tokio::time::interval(Duration::from_millis(PROCESS_UTP_STREAMS_INTERVAL));
         loop {
             tokio::select! {
-                Some(utp_request) = self.utp_event_rx.recv() => {
-                    self.process_utp_request(utp_request).await
-                },
-                Some(overlay_request) = self.overlay_rx.recv() => {
-                    self.process_overlay_request(overlay_request).await
+                    Some(utp_request) = self.utp_event_rx.recv() => {
+                        self.process_utp_request(utp_request).await
+                    },
+                    Some(overlay_request) = self.overlay_rx.recv() => {
+                        self.process_overlay_request(overlay_request).await
+                    },
+                    _ = process_utp_streams_interval.tick() => {
+                        let processed_streams = self.process_closed_streams();
+
+                        if let Err(err) = self.overlay_tx.send(UtpListenerEvent::ProcessedClosedStreams(processed_streams)) {
+                            error!("Unable to send ProcessClosedStreams event to overlay layer: {err}");
+                            continue
+                        }
                 }
             }
         }
@@ -345,11 +373,6 @@ impl UtpListener {
             UtpListenerRequest::AcceptStream(conn_id, accepted_keys) => {
                 self.listening
                     .insert(conn_id, UtpStreamId::AcceptStream(accepted_keys));
-            }
-            UtpListenerRequest::ProcessClosedStreams(tx) => {
-                if tx.send(self.process_closed_streams()).is_err() {
-                    error!("Unable to send closed uTP streams to requester")
-                };
             }
         }
     }

@@ -20,8 +20,12 @@ use crate::{
 };
 
 use crate::{
+    locks::RwLoggingExt,
     portalnet::types::content_key::RawContentKey,
-    utp::{stream::UtpPayload, trin_helpers::UtpStreamId},
+    utp::{
+        stream::{UtpListenerEvent, UtpPayload},
+        trin_helpers::UtpStreamId,
+    },
 };
 use delay_map::HashSetDelay;
 use discv5::{
@@ -40,7 +44,10 @@ use rand::seq::SliceRandom;
 use ssz::Encode;
 use ssz_types::{BitList, VariableList};
 use thiserror::Error;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    mpsc::{self, UnboundedReceiver, UnboundedSender},
+    RwLock as TRwLock,
+};
 
 /// Maximum number of ENRs in response to FindNodes.
 pub const FIND_NODES_MAX_NODES: usize = 32;
@@ -51,8 +58,6 @@ pub const FIND_CONTENT_MAX_NODES: usize = 32;
 const EXPECTED_NON_EMPTY_BUCKETS: usize = 17;
 /// Bucket refresh lookup interval in seconds
 const BUCKET_REFRESH_INTERVAL: u64 = 60;
-/// Process uTP streams interval in milliseconds
-const PROCESS_UTP_STREAMS_INTERVAL: u64 = 20;
 
 /// An overlay request error.
 #[derive(Clone, Error, Debug)]
@@ -261,6 +266,8 @@ pub struct OverlayService<TContentKey, TMetric> {
     response_tx: UnboundedSender<OverlayResponse>,
     /// The sender half of a channel to send requests to uTP listener
     utp_listener_tx: UnboundedSender<UtpListenerRequest>,
+    /// Receiver for UtpListener emitted events
+    utp_listener_rx: Arc<TRwLock<UnboundedReceiver<UtpListenerEvent>>>,
     /// Phantom content key.
     phantom_content_key: PhantomData<TContentKey>,
     /// Phantom metric (distance function).
@@ -286,6 +293,7 @@ impl<TContentKey: OverlayContentKey + Send, TMetric: Metric + Send>
         data_radius: Arc<U256>,
         protocol: ProtocolId,
         utp_listener_sender: UnboundedSender<UtpListenerRequest>,
+        utp_listener_receiver: Arc<TRwLock<UnboundedReceiver<UtpListenerEvent>>>,
         enable_metrics: bool,
     ) -> Result<UnboundedSender<OverlayRequest>, String> {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
@@ -318,6 +326,7 @@ impl<TContentKey: OverlayContentKey + Send, TMetric: Metric + Send>
                 response_rx,
                 response_tx,
                 utp_listener_tx: utp_listener_sender,
+                utp_listener_rx: utp_listener_receiver,
                 phantom_content_key: PhantomData,
                 phantom_metric: PhantomData,
                 metrics,
@@ -387,10 +396,11 @@ impl<TContentKey: OverlayContentKey + Send, TMetric: Metric + Send>
         // Construct bucket refresh interval
         let mut bucket_refresh_interval =
             tokio::time::interval(Duration::from_secs(BUCKET_REFRESH_INTERVAL));
-        let mut process_utp_streams_interval =
-            tokio::time::interval(Duration::from_millis(PROCESS_UTP_STREAMS_INTERVAL));
 
         loop {
+            let utp_listener_rx = self.utp_listener_rx.clone();
+            let mut utp_listener_lock = utp_listener_rx.write_with_warn().await;
+
             tokio::select! {
                 Some(request) = self.request_rx.recv() => self.process_request(request),
                 Some(response) = self.response_rx.recv() => {
@@ -419,20 +429,12 @@ impl<TContentKey: OverlayContentKey + Send, TMetric: Metric + Send>
                         self.peers_to_ping.insert(node_id);
                     }
                 }
-                _ = process_utp_streams_interval.tick() => {
-                    let (tx, rx) = tokio::sync::oneshot::channel::<Vec<(UtpPayload, UtpStreamId)>>();
-
-                    // Send request to uTP listener to process all closed uTP streams and wait for response
-                    if let Err(err) = self.utp_listener_tx.send(UtpListenerRequest::ProcessClosedStreams(tx)) {
-                        error!("Unable to send ProcessClosedStreams request to uTP listener: {err}");
-                        continue
-                    }
-
-                    match rx.await {
-                        Ok(streams) => {
-                            self.handle_utp_payload(streams);
+                Some(utp_event) = utp_listener_lock.recv() => {
+                    match utp_event {
+                        UtpListenerEvent::ProcessedClosedStreams(processed_streams) =>
+                        {
+                            self.handle_utp_payload(processed_streams);
                         }
-                        Err(err) => error!("Unable to receive ProcessClosedStreams response from uTP listener: {err}")
                     }
                 }
                 _ = OverlayService::<TContentKey, TMetric>::bucket_maintenance_poll(self.protocol.clone(), &self.kbuckets) => {}
@@ -781,7 +783,7 @@ impl<TContentKey: OverlayContentKey + Send, TMetric: Metric + Send>
     /// Process accepted uTP payload of the OFFER?ACCEPT stream
     fn process_accept_utp_payload(&self, content_keys: Vec<RawContentKey>, payload: UtpPayload) {
         // TODO: Verify the payload, store the content and propagate gossip.
-        debug!("DEBUG: Processing content keys: {content_keys:?}, with payload: {payload:?}");
+        debug!("DEBUG: Processing content keys: {content_keys:?}, with payload: {payload:?}, protocol: {:?}", self.protocol);
     }
 
     /// Processes an incoming request from some source node.
@@ -1311,6 +1313,7 @@ mod tests {
         let discovery = Arc::new(Discovery::new(portal_config).unwrap());
 
         let (utp_listener_tx, _) = unbounded_channel::<UtpListenerRequest>();
+        let (_, utp_listener_rx) = unbounded_channel::<UtpListenerEvent>();
 
         // Initialize DB config
         let storage_capacity: u32 = DEFAULT_STORAGE_CAPACITY.parse().unwrap();
@@ -1348,6 +1351,7 @@ mod tests {
             response_tx,
             response_rx,
             utp_listener_tx,
+            utp_listener_rx: Arc::new(TRwLock::new(utp_listener_rx)),
             phantom_content_key: PhantomData,
             phantom_metric: PhantomData,
             metrics,
