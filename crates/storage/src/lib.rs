@@ -1,5 +1,6 @@
 pub mod config;
 pub mod error;
+mod shared_ephemeral;
 pub mod sql;
 pub mod test_utils;
 pub mod utils;
@@ -19,6 +20,7 @@ use ethportal_api::{
     RawContentValue,
 };
 use rusqlite::types::{FromSql, FromSqlError, ValueRef};
+pub use shared_ephemeral::get_shared_ephemeral_store;
 
 pub const DATABASE_NAME: &str = "trin.sqlite";
 

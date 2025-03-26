@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use alloy::primitives::B256;
 use ethportal_api::{
@@ -13,7 +13,7 @@ use ethportal_api::{
         network::Subnetwork,
         portal::PaginateLocalContentInfo,
     },
-    BeaconContentKey, OverlayContentKey, RawContentValue,
+    BeaconContentKey, HistoryContentKey, OverlayContentKey, RawContentValue,
 };
 use light_client::consensus::rpc::portal_rpc::expected_current_slot;
 use r2d2::Pool;
@@ -26,6 +26,7 @@ use tree_hash::TreeHash;
 use trin_metrics::storage::StorageMetricsReporter;
 use trin_storage::{
     error::ContentStoreError,
+    get_shared_ephemeral_store,
     sql::{
         HISTORICAL_SUMMARIES_EPOCH_LOOKUP_QUERY, HISTORICAL_SUMMARIES_LOOKUP_QUERY,
         INSERT_BOOTSTRAP_QUERY, INSERT_LC_UPDATE_QUERY,
@@ -34,6 +35,7 @@ use trin_storage::{
         LC_UPDATE_LOOKUP_QUERY, LC_UPDATE_PERIOD_LOOKUP_QUERY, TOTAL_DATA_SIZE_QUERY_BEACON,
     },
     utils::get_total_size_of_directory_in_bytes,
+    versioned::EphemeralV1Store,
     ContentStore, DataSize, PortalStorageConfig, ShouldWeStoreContent,
 };
 
@@ -116,6 +118,8 @@ pub struct BeaconStorage {
     sql_connection_pool: Pool<SqliteConnectionManager>,
     metrics: StorageMetricsReporter,
     cache: BeaconStorageCache,
+    #[allow(unused)]
+    ephemeral_store: Arc<EphemeralV1Store<HistoryContentKey>>,
 }
 
 impl ContentStore for BeaconStorage {
@@ -289,12 +293,19 @@ impl ContentStore for BeaconStorage {
 }
 
 impl BeaconStorage {
-    pub fn new(config: PortalStorageConfig) -> Result<Self, ContentStoreError> {
+    pub fn new(
+        config: PortalStorageConfig,
+        start_ephemeral_background_task: bool,
+    ) -> Result<Self, ContentStoreError> {
+        // Get the shared ephemeral store instance
+        let ephemeral_store = get_shared_ephemeral_store(&config, start_ephemeral_background_task);
+
         let storage = Self {
             node_data_dir: config.node_data_dir,
             sql_connection_pool: config.sql_connection_pool,
             metrics: StorageMetricsReporter::new(Subnetwork::Beacon),
             cache: BeaconStorageCache::new(),
+            ephemeral_store,
         };
 
         // Report current total storage usage.
@@ -311,6 +322,10 @@ impl BeaconStorage {
             .report_content_data_storage_bytes(network_content_storage_usage as f64);
 
         Ok(storage)
+    }
+
+    pub fn new_with_defaults(config: PortalStorageConfig) -> Result<Self, ContentStoreError> {
+        Self::new(config, true)
     }
 
     /// Spawn a task to prune old  beacon data from the database on every new run and once a day
@@ -718,7 +733,7 @@ mod test {
     #[test]
     fn test_beacon_storage_get_put_bootstrap() {
         let (_temp_dir, config) = create_test_portal_storage_config_with_capacity(10).unwrap();
-        let mut storage = BeaconStorage::new(config).unwrap();
+        let mut storage = BeaconStorage::new(config, false).unwrap();
         let value = test_utils::get_light_client_bootstrap(0);
         let block_root = value
             .bootstrap
@@ -737,7 +752,7 @@ mod test {
     #[test]
     fn test_beacon_storage_get_put_updates_by_range() {
         let (_temp_dir, config) = create_test_portal_storage_config_with_capacity(10).unwrap();
-        let mut storage = BeaconStorage::new(config).unwrap();
+        let mut storage = BeaconStorage::new(config, false).unwrap();
         let key = BeaconContentKey::LightClientUpdatesByRange(LightClientUpdatesByRangeKey {
             start_period: 1,
             count: 2,
@@ -779,7 +794,7 @@ mod test {
     #[test]
     fn test_beacon_storage_get_put_finality_update() {
         let (_temp_dir, config) = create_test_portal_storage_config_with_capacity(10).unwrap();
-        let mut storage = BeaconStorage::new(config).unwrap();
+        let mut storage = BeaconStorage::new(config, false).unwrap();
         let value = test_utils::get_light_client_finality_update(0);
         let finalized_slot = value.update.finalized_header_deneb().unwrap().beacon.slot;
         let key = BeaconContentKey::LightClientFinalityUpdate(LightClientFinalityUpdateKey {
@@ -818,7 +833,7 @@ mod test {
     #[test]
     fn test_beacon_storage_get_put_optimistic_update() {
         let (_temp_dir, config) = create_test_portal_storage_config_with_capacity(10).unwrap();
-        let mut storage = BeaconStorage::new(config).unwrap();
+        let mut storage = BeaconStorage::new(config, false).unwrap();
         let value = test_utils::get_light_client_optimistic_update(0);
         let signature_slot = *value.update.signature_slot();
         let key = BeaconContentKey::LightClientOptimisticUpdate(LightClientOptimisticUpdateKey {
@@ -857,7 +872,7 @@ mod test {
     #[test]
     fn test_beacon_storage_get_put_historical_summaries() {
         let (_temp_dir, config) = create_test_portal_storage_config_with_capacity(10).unwrap();
-        let mut storage = BeaconStorage::new(config).unwrap();
+        let mut storage = BeaconStorage::new(config, false).unwrap();
         let (value, _) = test_utils::get_history_summaries_with_proof();
         let epoch = value.historical_summaries_with_proof.epoch;
         let key = BeaconContentKey::HistoricalSummariesWithProof(HistoricalSummariesWithProofKey {
@@ -903,7 +918,7 @@ mod test {
     #[test]
     fn test_beacon_storage_prune_old_bootstrap_data() {
         let (_temp_dir, config) = create_test_portal_storage_config_with_capacity(10).unwrap();
-        let mut storage = BeaconStorage::new(config).unwrap();
+        let mut storage = BeaconStorage::new(config, false).unwrap();
         let mut value = test_utils::get_light_client_bootstrap(0);
         // Set the bootstrap slot to outdated value
         let current_slot = expected_current_slot();

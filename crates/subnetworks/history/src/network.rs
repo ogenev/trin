@@ -55,7 +55,7 @@ impl HistoryNetwork {
             utp_transfer_limit: portal_config.utp_transfer_limit,
             ..Default::default()
         };
-        let storage = Arc::new(Mutex::new(HistoryStorage::new(
+        let storage = Arc::new(Mutex::new(HistoryStorage::new_with_defaults(
             storage_config,
             disable_history_storage,
         )?));

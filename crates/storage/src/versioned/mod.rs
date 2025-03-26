@@ -5,6 +5,7 @@ pub mod store;
 mod usage_stats;
 mod utils;
 
+pub use ephemeral_v1::{EphemeralV1Store, EphemeralV1StoreConfig};
 pub use id_indexed_v1::{IdIndexedV1Store, IdIndexedV1StoreConfig};
 use rusqlite::types::{FromSql, FromSqlError, ValueRef};
 pub use store::VersionedContentStore;

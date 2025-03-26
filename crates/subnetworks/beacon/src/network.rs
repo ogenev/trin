@@ -58,7 +58,9 @@ impl BeaconNetwork {
             gossip_dropped: GOSSIP_DROPPED,
             ..Default::default()
         };
-        let storage = Arc::new(PLMutex::new(BeaconStorage::new(storage_config)?));
+        let storage = Arc::new(PLMutex::new(BeaconStorage::new_with_defaults(
+            storage_config,
+        )?));
         storage.lock().spawn_pruning_task(); // Spawn pruning task to clean up expired content.
         let storage_clone = Arc::clone(&storage);
         let validator = Arc::new(BeaconValidator::new(header_oracle));
@@ -181,7 +183,9 @@ mod tests {
             .create(&Subnetwork::Beacon, Distance::MAX)
             .unwrap();
         // A mock storage that always returns None
-        let storage_clone = Arc::new(PLMutex::new(BeaconStorage::new(storage_config).unwrap()));
+        let storage_clone = Arc::new(PLMutex::new(
+            BeaconStorage::new_with_defaults(storage_config).unwrap(),
+        ));
 
         let result = get_trusted_block_root(&portal_config, storage_clone)
             .expect("Function should not fail with an Err");

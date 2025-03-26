@@ -1,10 +1,15 @@
+use std::sync::Arc;
+
 use ethportal_api::{
     types::{distance::Distance, network::Subnetwork, portal::PaginateLocalContentInfo},
     HistoryContentKey, OverlayContentKey, RawContentValue,
 };
 use trin_storage::{
     error::ContentStoreError,
-    versioned::{create_store, ContentType, IdIndexedV1Store, IdIndexedV1StoreConfig},
+    get_shared_ephemeral_store,
+    versioned::{
+        create_store, ContentType, EphemeralV1Store, IdIndexedV1Store, IdIndexedV1StoreConfig,
+    },
     ContentId, ContentStore, PortalStorageConfig, ShouldWeStoreContent,
 };
 
@@ -13,6 +18,8 @@ use trin_storage::{
 pub struct HistoryStorage {
     store: IdIndexedV1Store<HistoryContentKey>,
     disable_history_storage: bool,
+    #[allow(unused)]
+    ephemeral_store: Option<Arc<EphemeralV1Store<HistoryContentKey>>>,
 }
 
 impl ContentStore for HistoryStorage {
@@ -58,14 +65,34 @@ impl HistoryStorage {
     pub fn new(
         config: PortalStorageConfig,
         disable_history_storage: bool,
+        start_ephemeral_background_task: bool,
     ) -> Result<Self, ContentStoreError> {
         let sql_connection_pool = config.sql_connection_pool.clone();
-        let config =
-            IdIndexedV1StoreConfig::new(ContentType::HistoryEternal, Subnetwork::History, config);
+        let id_indexed_config = IdIndexedV1StoreConfig::new(
+            ContentType::HistoryEternal,
+            Subnetwork::History,
+            config.clone(),
+        );
+
+        // Get the shared ephemeral store instance
+        let ephemeral_store = get_shared_ephemeral_store(&config, start_ephemeral_background_task);
+
         Ok(Self {
-            store: create_store(ContentType::HistoryEternal, config, sql_connection_pool)?,
+            store: create_store(
+                ContentType::HistoryEternal,
+                id_indexed_config,
+                sql_connection_pool,
+            )?,
             disable_history_storage,
+            ephemeral_store: Some(ephemeral_store),
         })
+    }
+
+    pub fn new_with_defaults(
+        config: PortalStorageConfig,
+        disable_history_storage: bool,
+    ) -> Result<Self, ContentStoreError> {
+        Self::new(config, disable_history_storage, true)
     }
 
     /// Get a summary of the current state of storage
@@ -107,7 +134,7 @@ pub mod test {
         fn test_store_random_bytes() -> TestResult {
             let (temp_dir, storage_config) =
                 create_test_portal_storage_config_with_capacity(CAPACITY_MB).unwrap();
-            let mut storage = HistoryStorage::new(storage_config, false).unwrap();
+            let mut storage = HistoryStorage::new(storage_config, false, false).unwrap();
             let content_key = HistoryContentKey::random().unwrap();
             let mut value = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut value);
@@ -128,7 +155,7 @@ pub mod test {
     async fn test_get_data() -> Result<(), ContentStoreError> {
         let (temp_dir, storage_config) =
             create_test_portal_storage_config_with_capacity(CAPACITY_MB).unwrap();
-        let mut storage = HistoryStorage::new(storage_config, false)?;
+        let mut storage = HistoryStorage::new(storage_config, false, false)?;
         let content_key = HistoryContentKey::BlockHeaderByHash(BlockHeaderByHashKey::default());
         let value: Vec<u8> = "OGFWs179fWnqmjvHQFGHszXloc3Wzdb4".into();
         storage.put(content_key.clone(), &value)?;
