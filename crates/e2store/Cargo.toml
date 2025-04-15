@@ -19,13 +19,18 @@ clap = { workspace = true, optional = true }
 ethereum_ssz.workspace = true
 ethereum_ssz_derive.workspace = true
 ethportal-api.workspace = true
+hex = { workspace = true, optional = true }
 rand.workspace = true
 reqwest.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 scraper.workspace = true
 snap.workspace = true
 url.workspace = true
+rayon = "1.10.0"
 
 [dev-dependencies]
 rstest.workspace = true
@@ -34,7 +39,12 @@ trin-utils.workspace = true
 
 [features]
 e2ss-stats-binary = ["clap", "tracing", "tracing-subscriber"]
+era-reader-binary = ["clap", "serde_json", "serde_yaml", "hex", "serde"]
 
 [[bin]]
 name = "e2ss-stats"
 required-features = ["e2ss-stats-binary"]
+
+[[bin]]
+name = "era-reader"
+required-features = ["era-reader-binary"]
